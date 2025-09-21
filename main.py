@@ -83,6 +83,10 @@ def file_id_to_filename(fid: str) -> str:
 def health():
     return {"ok": True}
 
+@app.get("/__ping")
+def __ping():
+    return "OK"
+
 @app.get("/")
 def root():
     return {
