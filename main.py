@@ -1,6 +1,7 @@
 # main.py
-import os
-from typing import List, Optional, Dict, Any
+import os, time, json, hashlib
+from typing import List, Optional, Dict, Any, Deque
+from collections import defaultdict, deque
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,28 +9,39 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# ── load env (works locally; Railway uses real env) ───────────────────────────
+# ── load env ──────────────────────────────────────────────────────────────────
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID")
 WIX_ORIGIN = os.getenv("WIX_ORIGIN", "https://www.vimarshafoundation.org")
 
-# Don’t raise here; allow app to start so we can debug /debug/env
+# Rate limit config
+MAX_REQ_PER_IP_PER_DAY = int(os.getenv("MAX_REQ_PER_IP_PER_DAY", "50"))
+
+# Redis (optional but recommended)
+REDIS_URL = os.getenv("REDIS_URL")
+try:
+    import redis  # add redis>=5.0.1 to requirements.txt
+    r = redis.from_url(REDIS_URL) if REDIS_URL else None
+except Exception:
+    r = None
+
+# OpenAI client (lazy: app still boots if missing)
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-app = FastAPI(title="Vimarsha Chat API", version="1.1")
+app = FastAPI(title="Vimarsha Chat API", version="1.2")
 
-# CORS: loosen for first deploy; tighten later
+# ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change to [WIX_ORIGIN] once working
+    allow_origins=[WIX_ORIGIN],
     allow_credentials=True,
-    allow_methods=["POST","GET","OPTIONS"],
+    allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# ── models ───────────────────────────────────────────────────────────────────
+# ── models ────────────────────────────────────────────────────────────────────
 class AskIn(BaseModel):
     question: str
     userId: Optional[str] = None
@@ -38,10 +50,60 @@ class AskOut(BaseModel):
     answer: str
     references: List[str] = []
 
+# ── rate limiting + caching ───────────────────────────────────────────────────
+WINDOW_SECONDS = 24 * 60 * 60
+_ip_hits: Dict[str, Deque[float]] = defaultdict(deque)
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+def get_client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    return fwd.split(",")[0].strip() if fwd else request.client.host
+
+def check_rate_limit(request: Request):
+    ip = get_client_ip(request)
+    today_key = f"rl:{ip}:{time.strftime('%Y%m%d')}"
+    if r:
+        try:
+            pipe = r.pipeline()
+            pipe.incr(today_key, 1)
+            pipe.expire(today_key, 2 * 24 * 60 * 60)
+            count, _ = pipe.execute()
+            if int(count) > MAX_REQ_PER_IP_PER_DAY:
+                raise HTTPException(429, "Rate limit exceeded. Try again tomorrow.")
+            return
+        except Exception:
+            pass
+    # fallback: in-memory
+    now = time.time()
+    q = _ip_hits[ip]
+    while q and (now - q[0] > WINDOW_SECONDS):
+        q.popleft()
+    if len(q) >= MAX_REQ_PER_IP_PER_DAY:
+        raise HTTPException(429, "Rate limit exceeded. Try again tomorrow.")
+    q.append(now)
+
+def _qkey(q: str) -> str:
+    norm = " ".join((q or "").lower().split())
+    return "cache:q:" + hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+def get_cached_answer(q: str):
+    if not r:
+        return None
+    try:
+        val = r.get(_qkey(q))
+        return json.loads(val) if val else None
+    except Exception:
+        return None
+
+def set_cached_answer(q: str, payload: Dict[str, Any], ttl: int = 86400):
+    if not r:
+        return
+    try:
+        r.setex(_qkey(q), ttl, json.dumps(payload))
+    except Exception:
+        pass
+
+# ── OpenAI helpers ────────────────────────────────────────────────────────────
 def ensure_env_ready():
-    """Raise a helpful error if required env vars are missing."""
     missing = []
     if not OPENAI_API_KEY: missing.append("OPENAI_API_KEY")
     if not OPENAI_VECTOR_STORE_ID: missing.append("OPENAI_VECTOR_STORE_ID")
@@ -77,8 +139,7 @@ def file_id_to_filename(fid: str) -> str:
     except Exception:
         return f"file:{fid}"
 
-
-# ── routes ───────────────────────────────────────────────────────────────────
+# ── routes ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -87,13 +148,16 @@ def health():
 def __ping():
     return "OK"
 
-@app.get("/")
-def root():
-    return {
-        "ok": True,
-        "message": "Vimarsha Chat API",
-        "endpoints": ["/health", "/debug/env", "POST /ask"],
-    }
+@app.get("/redis-test")
+def redis_test():
+    if not r:
+        return {"ok": False, "error": "Redis not configured"}
+    try:
+        r.set("hello", "world", ex=60)
+        val = r.get("hello")
+        return {"ok": True, "hello": val.decode() if val else None}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.get("/debug/env")
 def debug_env():
@@ -103,6 +167,8 @@ def debug_env():
         "OPENAI_MODEL": present(OPENAI_MODEL),
         "OPENAI_VECTOR_STORE_ID": present(OPENAI_VECTOR_STORE_ID),
         "WIX_ORIGIN": present(WIX_ORIGIN),
+        "REDIS_URL_set": bool(REDIS_URL),
+        "MAX_REQ_PER_IP_PER_DAY": MAX_REQ_PER_IP_PER_DAY,
     }
 
 @app.post("/ask", response_model=AskOut)
@@ -111,16 +177,24 @@ def ask(body: AskIn, request: Request):
     if client is None:
         raise HTTPException(500, "OpenAI client not initialized.")
 
+    # rate-limit
+    check_rate_limit(request)
+
     q = (body.question or "").strip()
     if not q:
         raise HTTPException(400, "Question is required")
+
+    # cache lookup
+    cached = get_cached_answer(q)
+    if cached:
+        return AskOut(**cached)
 
     system_msg = (
         "You are a strict research assistant. Use ONLY the file_search tool and the provided vector store. "
         "Every sentence must be backed by retrieved passages with inline markers like [1], [2]. "
         "Do NOT use outside knowledge. If no relevant passages are found, reply exactly: "
         "'I don’t have evidence for that in the provided documents.' "
-        "Do NOT include a References section; the UI will render references."
+        "Do NOT include a References section; the UI will render references. "
         "Do not use Markdown formatting (no **bold**, no headings). Output plain text only."
     )
 
@@ -133,37 +207,24 @@ def ask(body: AskIn, request: Request):
             ],
             tools=[{"type": "file_search", "vector_store_ids": [OPENAI_VECTOR_STORE_ID]}],
             temperature=0.2,
-            # optional cap:
-            # max_output_tokens=800,
         )
     except Exception as e:
-        detail = str(e)
-        r = getattr(e, "response", None)
-        if r is not None:
-            try:
-                status = getattr(r, "status_code", "?")
-                txt = getattr(r, "text", "")
-                detail = f"HTTP {status}: {txt}"
-            except Exception:
-                pass
-        raise HTTPException(502, f"OpenAI call failed: {detail}")
+        raise HTTPException(502, f"OpenAI call failed: {e}")
 
     answer = getattr(resp, "output_text", None) or "No answer."
-
     d = resp.model_dump()
     file_ids = collect_citation_file_ids(d)
     refs = [file_id_to_filename(fid) for fid in file_ids]
 
-    # if no citations, enforce grounded-only policy:
     if not refs:
-        return AskOut(
-            answer="I don’t have evidence for that in the provided documents.",
-            references=[]
-        )
+        payload = {"answer": "I don’t have evidence for that in the provided documents.", "references": []}
+        set_cached_answer(q, payload)
+        return AskOut(**payload)
 
-    # word bound enforcement (1–1000 words)
     wc = len(answer.split())
     if wc < 1 or wc > 1000:
-        answer = "⚠️ The response length is outside allowed bounds (1–1000 words). Please refine your question."
+        answer = "The response length is outside allowed bounds (1–1000 words). Please refine your question."
 
-    return AskOut(answer=answer, references=refs)
+    payload = {"answer": answer, "references": refs}
+    set_cached_answer(q, payload)
+    return AskOut(**payload)
