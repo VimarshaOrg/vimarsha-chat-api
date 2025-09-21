@@ -20,12 +20,11 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 app = FastAPI(title="Vimarsha Chat API", version="1.1")
 
-# CORS: loosen for first deploy; tighten later
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change to [WIX_ORIGIN] once working
+    allow_origins=["https://www.vimarshafoundation.org"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["POST","GET","OPTIONS"],
     allow_headers=["*"],
 )
 
