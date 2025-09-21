@@ -121,6 +121,7 @@ def ask(body: AskIn, request: Request):
         "Do NOT use outside knowledge. If no relevant passages are found, reply exactly: "
         "'I don’t have evidence for that in the provided documents.' "
         "Do NOT include a References section; the UI will render references."
+        "Do not use Markdown formatting (no **bold**, no headings). Output plain text only."
     )
 
     try:
