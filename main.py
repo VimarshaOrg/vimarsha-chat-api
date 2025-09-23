@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import OpenAI
+import re
 
 # ── load env ──────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -53,6 +54,11 @@ class AskOut(BaseModel):
 # ── rate limiting + caching ───────────────────────────────────────────────────
 WINDOW_SECONDS = 24 * 60 * 60
 _ip_hits: Dict[str, Deque[float]] = defaultdict(deque)
+
+def strip_bold(text: str) -> str:
+    if not text:
+        return text
+    return re.sub(r"\*\*(.*?)\*\*", r"\1", text)
 
 def get_client_ip(request: Request) -> str:
     fwd = request.headers.get("x-forwarded-for")
@@ -215,6 +221,7 @@ def ask(body: AskIn, request: Request):
         raise HTTPException(502, f"OpenAI call failed: {e}")
 
     answer = getattr(resp, "output_text", None) or "No answer."
+    answer = strip_bold(answer)
     d = resp.model_dump()
     file_ids = collect_citation_file_ids(d)
     refs = [file_id_to_filename(fid) for fid in file_ids]
