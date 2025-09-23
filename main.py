@@ -135,7 +135,10 @@ def collect_citation_file_ids(obj: Any) -> List[str]:
 def file_id_to_filename(fid: str) -> str:
     try:
         meta = client.files.retrieve(fid) if client else None
-        return getattr(meta, "filename", f"file:{fid}") if meta else f"file:{fid}"
+        fname = getattr(meta, "filename", f"file:{fid}") if meta else f"file:{fid}"
+        # strip file extension like .pdf, .txt, etc.
+        base, _ = os.path.splitext(fname)
+        return base
     except Exception:
         return f"file:{fid}"
 
