@@ -23,7 +23,7 @@ ANSWER_FORMAT = os.getenv("ANSWER_FORMAT", "html").lower().strip()
 MAX_REQ_PER_IP_PER_DAY = int(os.getenv("MAX_REQ_PER_IP_PER_DAY", "50"))
 
 # cache TTL (seconds)
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "86400"))  # 1 day
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "10"))  # 1 day
 
 # Redis (optional)
 REDIS_URL = os.getenv("REDIS_URL")
