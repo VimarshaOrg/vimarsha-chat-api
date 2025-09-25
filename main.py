@@ -219,7 +219,7 @@ def ask(body: AskIn, request: Request):
             ],
             tools=[{"type": "file_search", "vector_store_ids": [OPENAI_VECTOR_STORE_ID]}],
             temperature=0.0,
-            max_output_tokens=600,
+            max_output_tokens=1600,
         )
         t4 = time.time()
     except Exception as e:
