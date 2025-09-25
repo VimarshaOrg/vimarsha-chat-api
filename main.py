@@ -24,7 +24,7 @@ CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "86400"))  # 1 day
 # Redis (optional)
 REDIS_URL = os.getenv("REDIS_URL")
 try:
-    import redis  # make sure requirements.txt has: redis>=5.0.1
+    import redis  # ensure requirements.txt has: redis>=5.0.1
     r = redis.from_url(REDIS_URL) if REDIS_URL else None
 except Exception:
     r = None
@@ -35,7 +35,7 @@ _cache_mem: Dict[str, Dict[str, Any]] = {}
 # OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-app = FastAPI(title="Vimarsha Chat API", version="1.5")
+app = FastAPI(title="Vimarsha Chat API", version="1.6-md")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CORS (loose for testing; tighten to [WIX_ORIGIN] when live)
@@ -56,20 +56,14 @@ class AskIn(BaseModel):
     userId: Optional[str] = None
 
 class AskOut(BaseModel):
-    answer: str
+    answer: str           # now returns Markdown (bold + bullets)
     references: List[str] = []
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers: text cleanup, rate limiting, caching
+# Helpers: rate limiting, caching
 # ──────────────────────────────────────────────────────────────────────────────
 WINDOW_SECONDS = 24 * 60 * 60
 _ip_hits: Dict[str, Deque[float]] = defaultdict(deque)
-
-def strip_bold(text: str) -> str:
-    """Convert **bold** to plain for Wix text rendering (plain text mode)."""
-    if not text:
-        return text
-    return re.sub(r"\*\*(.*?)\*\*", r"\1", text)
 
 def normalize_question(q: str) -> str:
     """Normalize to increase cache hits across small variations."""
@@ -231,13 +225,15 @@ def debug_env():
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Two-stage retrieval: STRICT → BROAD (fallback)
+# (Now allowing basic Markdown: **bold**, and "-" bullet points)
 # ──────────────────────────────────────────────────────────────────────────────
 STRICT_MSG = (
     "Use ONLY the file_search tool with the provided vector store. "
     "Retrieve at most the top 3 most relevant passages; ignore lower-score matches. "
     "Every sentence must be supported by retrieved passages with inline [1], [2] markers. "
     "If no evidence, reply exactly: 'I don’t have evidence for that in the provided documents.' "
-    "Plain text only (no Markdown)."
+    "Output in plain text with basic Markdown: use **bold** for key terms and '-' for bullet points. "
+    "Do not use headings, tables, links, or images."
 )
 
 BROAD_MSG = (
@@ -246,7 +242,8 @@ BROAD_MSG = (
     "Aim to support every sentence with inline markers like [1], [2]. "
     "If any sentence cannot be strictly supported, remove it rather than speculate. "
     "If no evidence is found, reply exactly: 'I don’t have evidence for that in the provided documents.' "
-    "Plain text only (no Markdown)."
+    "Output in plain text with basic Markdown: use **bold** for key terms and '-' for bullet points. "
+    "Do not use headings, tables, links, or images."
 )
 
 @app.post("/ask", response_model=AskOut)
@@ -294,7 +291,6 @@ def ask(body: AskIn, request: Request):
     t_ai1 = time.time()
 
     answer = getattr(resp, "output_text", None) or "No answer."
-    answer = strip_bold(answer)
     d = resp.model_dump()
     file_ids = collect_citation_file_ids(d)
     refs = [file_id_to_filename(fid) for fid in file_ids]
@@ -331,7 +327,6 @@ def ask(body: AskIn, request: Request):
         t_ai3 = time.time()
 
         answer2 = getattr(resp2, "output_text", None) or "No answer."
-        answer2 = strip_bold(answer2)
         d2 = resp2.model_dump()
         file_ids2 = collect_citation_file_ids(d2)
         refs2 = [file_id_to_filename(fid) for fid in file_ids2]
