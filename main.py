@@ -19,8 +19,8 @@ OPENAI_VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID")
 WIX_ORIGIN = os.getenv("WIX_ORIGIN", "https://www.vimarshafoundation.org")
 
 MAX_REQ_PER_IP_PER_DAY = int(os.getenv("MAX_REQ_PER_IP_PER_DAY", "50"))
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "86400"))  # 1 day
-BROAD_TIMEOUT_SECONDS = int(os.getenv("BROAD_TIMEOUT_SECONDS", "8"))  # UX guardrail
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "86400"))            # 1 day
+BROAD_TIMEOUT_SECONDS = int(os.getenv("BROAD_TIMEOUT_SECONDS", "8"))        # UX guardrail
 
 # Redis (optional)
 REDIS_URL = os.getenv("REDIS_URL")
@@ -36,7 +36,7 @@ _cache_mem: Dict[str, Dict[str, Any]] = {}
 # OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-app = FastAPI(title="Vimarsha Chat API", version="1.9-timeout-html")
+app = FastAPI(title="Vimarsha Chat API", version="2.0-paragraphs")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CORS (loose for testing; tighten to [WIX_ORIGIN] when live)
@@ -190,7 +190,7 @@ def file_id_to_filename(fid: str) -> str:
         return f"file:{fid}"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Markdown-lite → HTML (bold + bullets + paragraphs)
+# Markdown-lite → HTML (bold + numbered/unnumbered lists + paragraphs)
 # ──────────────────────────────────────────────────────────────────────────────
 _bold_re = re.compile(r"\*\*(.+?)\*\*")
 _sentence_split = re.compile(r"(?<=[.!?])\s+")
@@ -200,7 +200,8 @@ def md_lite_to_html(md: str) -> str:
     """
     Converts very simple Markdown to HTML:
       - **bold** → <strong>
-      - lines starting with '-' → <ul><li>…</li></ul>
+      - lines "1. ..." "2. ..." → <ol><li>…</li></ol>
+      - lines starting with '-' or '* ' → <ul><li>…</li></ul>
       - other non-empty lines → <p>…</p>
     HTML-escapes all text first, then restores <strong>.
     """
@@ -213,59 +214,97 @@ def md_lite_to_html(md: str) -> str:
     esc_lines = [restore_bold(s) for s in esc_lines]
 
     html_parts: List[str] = []
-    in_list = False
+    in_ul = False
+    in_ol = False
+
+    def close_lists():
+        nonlocal in_ul, in_ol
+        if in_ul:
+            html_parts.append("</ul>")
+            in_ul = False
+        if in_ol:
+            html_parts.append("</ol>")
+            in_ol = False
+
     for s in esc_lines:
         stripped = s.strip()
         if not stripped:
-            if in_list:
-                html_parts.append("</ul>")
-                in_list = False
+            close_lists()
             continue
-        if stripped.startswith("- "):
-            if not in_list:
-                html_parts.append("<ul>")
-                in_list = True
-            html_parts.append(f"<li>{stripped[2:].strip()}</li>")
-        else:
-            if in_list:
+
+        # ordered list: "1. " or "23. "
+        if re.match(r"^\d+\.\s+", stripped):
+            if in_ul:
                 html_parts.append("</ul>")
-                in_list = False
-            html_parts.append(f"<p>{stripped}</p>")
-    if in_list:
-        html_parts.append("</ul>")
+                in_ul = False
+            if not in_ol:
+                html_parts.append("<ol>")
+                in_ol = True
+            item = re.sub(r"^\d+\.\s+", "", stripped)
+            html_parts.append(f"<li>{item}</li>")
+            continue
+
+        # unordered list: "- " or "* "
+        if stripped.startswith("- ") or stripped.startswith("* "):
+            if in_ol:
+                html_parts.append("</ol>")
+                in_ol = False
+            if not in_ul:
+                html_parts.append("<ul>")
+                in_ul = True
+            item = stripped[2:].strip()
+            html_parts.append(f"<li>{item}</li>")
+            continue
+
+        # paragraph
+        close_lists()
+        html_parts.append(f"<p>{stripped}</p>")
+
+    close_lists()
     return "".join(html_parts)
 
 def force_inline_if_single_ref(answer_text: str, refs: List[str]) -> str:
-    """If exactly one reference and no [n] markers, append [1] to each sentence."""
+    """If exactly one reference and no [n] markers, append [1] to each paragraph end."""
     if not answer_text or len(refs) != 1:
         return answer_text
     if _has_marker.search(answer_text):
         return answer_text
-    parts = _sentence_split.split(answer_text.strip())
-    parts = [p + " [1]" if p and not _has_marker.search(p) else p for p in parts]
-    return " ".join(parts)
+    # Add [1] at end of each paragraph line
+    lines = [ln.strip() for ln in answer_text.strip().splitlines()]
+    new_lines = []
+    for ln in lines:
+        if not ln:
+            new_lines.append(ln)
+            continue
+        if not _has_marker.search(ln):
+            new_lines.append(ln + " [1]")
+        else:
+            new_lines.append(ln)
+    return "\n".join(new_lines)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Prompts (broader retrieval & paragraph-level citations)
+# Prompts (paragraph-first; optional numbered list)
 # ──────────────────────────────────────────────────────────────────────────────
 STRICT_MSG = (
     "Use ONLY the file_search tool with the provided vector store. "
-    "Retrieve the top ~5 most relevant passages (avoid near-duplicate text). "
-    "Support each claim with inline numeric citations like [1], [2] at least once per bullet or paragraph. "
-    "If no evidence, reply exactly: 'I don’t have evidence for that in the provided documents.' "
-    "Output in plain text with basic Markdown: use **bold** for key terms and '-' bullets. No headings/tables/links/images. "
-    "Aim for 3–5 bullet points plus a short synthesizing paragraph."
+    "Retrieve the top ~6 most relevant, non-duplicate passages. "
+    "Write a coherent mini-essay of 2–3 paragraphs (free-flowing prose; no headings). "
+    "End each paragraph with compact source markers like [1] or [1][2] that support that paragraph. "
+    "Optionally include a short numbered list (1., 2., …) if it genuinely clarifies sub-points. "
+    "Avoid speculation. If no evidence is found, reply exactly: "
+    "'I don’t have evidence for that in the provided documents.' "
+    "Target 180–350 words. Plain text with **bold** allowed; no links/tables/images."
 )
 
 BROAD_MSG = (
     "Use ONLY the file_search tool with the provided vector store. "
-    "Retrieve about 10–12 relevant passages from diverse documents; prefer coverage over repetition. "
-    "Include all distinct sources that substantively support the answer (do not collapse to one). "
-    "Support each claim with inline numeric citations like [1], [2] at least once per bullet or paragraph. "
-    "If a claim cannot be supported, remove it. If no evidence is found, reply exactly: "
+    "Retrieve about 10–12 diverse passages from different documents (prefer coverage over repetition). "
+    "Write a fuller answer with 3–4 paragraphs of free-flowing prose (no headings). "
+    "Each paragraph should end with compact markers like [1] or [2][3]. "
+    "You may add one short numbered list (1., 2., …) if it truly helps understanding. "
+    "Remove unsupported claims. If no evidence is found, reply exactly: "
     "'I don’t have evidence for that in the provided documents.' "
-    "Output in plain text with basic Markdown: use **bold** and '-' bullets; no headings/tables/links/images. "
-    "Aim for 3–6 bullet points plus 1–2 concise paragraphs."
+    "Target 250–450 words. Plain text with **bold** allowed; no links/tables/images."
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -322,7 +361,7 @@ def ask(body: AskIn, request: Request):
     # Rate-limit only when calling OpenAI
     check_rate_limit(request)
 
-    # --- 1) STRICT attempt (broader than before, ~5) ---
+    # --- 1) STRICT attempt (paragraph-first) ---
     try:
         resp = client.responses.create(
             model=OPENAI_MODEL,
@@ -331,8 +370,8 @@ def ask(body: AskIn, request: Request):
                 {"role": "user", "content": q},
             ],
             tools=[{"type": "file_search", "vector_store_ids": [OPENAI_VECTOR_STORE_ID]}],
-            temperature=0.2,
-            max_output_tokens=1200,
+            temperature=0.3,
+            max_output_tokens=1400,
         )
     except Exception as e:
         raise HTTPException(502, f"OpenAI call failed: {e}")
@@ -352,7 +391,7 @@ def ask(body: AskIn, request: Request):
         set_cached_answer(q, payload)
         return AskOut(**payload)
 
-    # --- 2) BROAD attempt with timeout (10–12 passages) ---
+    # --- 2) BROAD attempt with timeout (diverse passages) ---
     def broad_call():
         return client.responses.create(
             model=OPENAI_MODEL,
@@ -361,8 +400,8 @@ def ask(body: AskIn, request: Request):
                 {"role": "user", "content": q},
             ],
             tools=[{"type": "file_search", "vector_store_ids": [OPENAI_VECTOR_STORE_ID]}],
-            temperature=0.2,
-            max_output_tokens=1200,
+            temperature=0.3,
+            max_output_tokens=1600,
         )
 
     try:
@@ -373,7 +412,7 @@ def ask(body: AskIn, request: Request):
         payload = {"answer": md_lite_to_html("Search took too long, please refine your question."), "references": []}
         set_cached_answer(q, payload, ttl=60)  # short cache to keep UX snappy
         return AskOut(**payload)
-    except Exception as e:
+    except Exception:
         payload = {"answer": md_lite_to_html("I don’t have evidence for that in the provided documents."), "references": []}
         set_cached_answer(q, payload)
         return AskOut(**payload)
