@@ -1,5 +1,5 @@
 # main.py
-import os, time, json, hashlib, re
+import os, time, json, hashlib, re, html
 from typing import List, Optional, Dict, Any, Deque
 from collections import defaultdict, deque
 
@@ -24,7 +24,7 @@ CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "86400"))  # 1 day
 # Redis (optional)
 REDIS_URL = os.getenv("REDIS_URL")
 try:
-    import redis  # ensure requirements.txt has: redis>=5.0.1
+    import redis  # requirements.txt: redis>=5.0.1
     r = redis.from_url(REDIS_URL) if REDIS_URL else None
 except Exception:
     r = None
@@ -35,7 +35,7 @@ _cache_mem: Dict[str, Dict[str, Any]] = {}
 # OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-app = FastAPI(title="Vimarsha Chat API", version="1.6-md")
+app = FastAPI(title="Vimarsha Chat API", version="1.8-html")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CORS (loose for testing; tighten to [WIX_ORIGIN] when live)
@@ -56,7 +56,8 @@ class AskIn(BaseModel):
     userId: Optional[str] = None
 
 class AskOut(BaseModel):
-    answer: str           # now returns Markdown (bold + bullets)
+    # NOTE: answer is HTML (not Markdown)
+    answer: str
     references: List[str] = []
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -66,7 +67,6 @@ WINDOW_SECONDS = 24 * 60 * 60
 _ip_hits: Dict[str, Deque[float]] = defaultdict(deque)
 
 def normalize_question(q: str) -> str:
-    """Normalize to increase cache hits across small variations."""
     q = (q or "").lower().strip()
     q = re.sub(r"[\s\-–—_:;,.!?/\\]+", " ", q)
     return q
@@ -189,6 +189,96 @@ def file_id_to_filename(fid: str) -> str:
         return f"file:{fid}"
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Markdown-lite → HTML (bold + bullets + paragraphs)
+# ──────────────────────────────────────────────────────────────────────────────
+_bold_re = re.compile(r"\*\*(.+?)\*\*")
+
+def md_lite_to_html(md: str) -> str:
+    """
+    Converts very simple Markdown to HTML:
+      - **bold** → <strong>
+      - lines starting with '-' → <ul><li>…</li></ul>
+      - other non-empty lines → <p>…</p>
+    HTML-escapes all text first, then restores <strong>.
+    """
+    if not md:
+        return ""
+
+    # Split lines, detect bullet blocks
+    lines = md.strip().splitlines()
+
+    # First HTML-escape the entire line content
+    esc_lines = [html.escape(line) for line in lines]
+
+    # Restore bold (** … **) inside each line
+    def restore_bold(s: str) -> str:
+        return _bold_re.sub(r"<strong>\1</strong>", s)
+
+    esc_lines = [restore_bold(s) for s in esc_lines]
+
+    html_parts: List[str] = []
+    in_list = False
+
+    for s in esc_lines:
+        stripped = s.strip()
+        if not stripped:
+            # blank line closes a list if open
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            continue
+
+        if stripped.startswith("- "):
+            if not in_list:
+                html_parts.append("<ul>")
+                in_list = True
+            html_parts.append(f"<li>{stripped[2:].strip()}</li>")
+        else:
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            html_parts.append(f"<p>{stripped}</p>")
+
+    if in_list:
+        html_parts.append("</ul>")
+
+    return "".join(html_parts)
+
+# If there is exactly one reference and no [n] markers, append [1] to each sentence
+_sentence_split = re.compile(r"(?<=[.!?])\s+")
+_has_marker = re.compile(r"\[\d+\]")
+
+def force_inline_if_single_ref(answer_text: str, refs: List[str]) -> str:
+    if not answer_text or len(refs) != 1:
+        return answer_text
+    if _has_marker.search(answer_text):
+        return answer_text
+    parts = _sentence_split.split(answer_text.strip())
+    parts = [p + " [1]" if p and not _has_marker.search(p) else p for p in parts]
+    return " ".join(parts)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Prompts
+# ──────────────────────────────────────────────────────────────────────────────
+STRICT_MSG = (
+    "Use ONLY the file_search tool with the provided vector store. "
+    "Retrieve at most the top 3 most relevant passages; ignore lower-score matches. "
+    "Every sentence MUST include an inline numeric citation like [1], [2] matching the References list. "
+    "Prefer concise bullet points for key ideas. "
+    "If no evidence, reply exactly: 'I don’t have evidence for that in the provided documents.' "
+    "Output in plain text with basic Markdown: use **bold** and '-' bullets. No headings/tables/links/images."
+)
+
+BROAD_MSG = (
+    "Use ONLY the file_search tool with the provided vector store. "
+    "Retrieve about 6–8 relevant passages from diverse documents; prefer coverage over repetition. "
+    "Every sentence MUST include an inline numeric citation like [1], [2] matching the References list. "
+    "Prefer concise bullet points for key ideas. Remove any sentence you cannot support. "
+    "If no evidence is found, reply exactly: 'I don’t have evidence for that in the provided documents.' "
+    "Output in plain text with basic Markdown: use **bold** and '-' bullets. No headings/tables/links/images."
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Routes
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -223,29 +313,6 @@ def debug_env():
         "CACHE_TTL_SECONDS": CACHE_TTL_SECONDS,
     }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Two-stage retrieval: STRICT → BROAD (fallback)
-# (Now allowing basic Markdown: **bold**, and "-" bullet points)
-# ──────────────────────────────────────────────────────────────────────────────
-STRICT_MSG = (
-    "Use ONLY the file_search tool with the provided vector store. "
-    "Retrieve at most the top 3 most relevant passages; ignore lower-score matches. "
-    "Every sentence must be supported by retrieved passages with inline [1], [2] markers. "
-    "If no evidence, reply exactly: 'I don’t have evidence for that in the provided documents.' "
-    "Output in plain text with basic Markdown: use **bold** for key terms and '-' for bullet points. "
-    "Do not use headings, tables, links, or images."
-)
-
-BROAD_MSG = (
-    "Use ONLY the file_search tool with the provided vector store. "
-    "Retrieve about 6–8 relevant passages from diverse documents; prefer coverage over repetition. "
-    "Aim to support every sentence with inline markers like [1], [2]. "
-    "If any sentence cannot be strictly supported, remove it rather than speculate. "
-    "If no evidence is found, reply exactly: 'I don’t have evidence for that in the provided documents.' "
-    "Output in plain text with basic Markdown: use **bold** for key terms and '-' for bullet points. "
-    "Do not use headings, tables, links, or images."
-)
-
 @app.post("/ask", response_model=AskOut)
 def ask(body: AskIn, request: Request):
     t0 = time.time()
@@ -258,23 +325,14 @@ def ask(body: AskIn, request: Request):
         raise HTTPException(400, "Question is required")
 
     # ==== CACHE FIRST ====
-    t_c0, cached = time.time(), get_cached_answer(q)
-    t_c1 = time.time()
+    cached = get_cached_answer(q)
     if cached:
-        print({
-            "phase": "cache_hit",
-            "t_total_ms": int((time.time() - t0) * 1000),
-            "t_cache_ms": int((t_c1 - t_c0) * 1000),
-        })
         return AskOut(**cached)
 
-    # Rate limit only if we’re going to call OpenAI
-    t_rl0 = time.time()
+    # Rate-limit only when calling OpenAI
     check_rate_limit(request)
-    t_rl1 = time.time()
 
-    # --- 1) STRICT attempt (top-3) ---
-    t_ai0 = time.time()
+    # --- 1) STRICT attempt ---
     try:
         resp = client.responses.create(
             model=OPENAI_MODEL,
@@ -288,32 +346,26 @@ def ask(body: AskIn, request: Request):
         )
     except Exception as e:
         raise HTTPException(502, f"OpenAI call failed: {e}")
-    t_ai1 = time.time()
 
-    answer = getattr(resp, "output_text", None) or "No answer."
+    answer_txt = getattr(resp, "output_text", None) or "No answer."
     d = resp.model_dump()
     file_ids = collect_citation_file_ids(d)
     refs = [file_id_to_filename(fid) for fid in file_ids]
 
-    # If STRICT found citations → return
     if refs:
-        wc = len(answer.split())
+        wc = len(answer_txt.split())
         if wc < 1 or wc > 1000:
-            answer = "The response length is outside allowed bounds (1–1000 words). Please refine your question."
-        payload = {"answer": answer, "references": refs}
+            answer_txt = "The response length is outside allowed bounds (1–1000 words). Please refine your question."
+        # ensure inline markers if single ref
+        answer_txt = force_inline_if_single_ref(answer_txt, refs)
+        # convert to HTML for Wix
+        answer_html = md_lite_to_html(answer_txt)
+        payload = {"answer": answer_html, "references": refs}
         set_cached_answer(q, payload)
-        print({
-            "phase": "cache_miss_strict_success",
-            "t_total_ms": int((time.time() - t0) * 1000),
-            "t_cache_ms": int((t_c1 - t_c0) * 1000),
-            "t_rate_limit_ms": int((t_rl1 - t_rl0) * 1000),
-            "t_openai_strict_ms": int((t_ai1 - t_ai0) * 1000),
-        })
         return AskOut(**payload)
 
-    # --- 2) BROAD attempt (6–8 diverse) if STRICT produced no refs ---
+    # --- 2) BROAD attempt if STRICT produced no refs ---
     try:
-        t_ai2 = time.time()
         resp2 = client.responses.create(
             model=OPENAI_MODEL,
             input=[
@@ -324,46 +376,25 @@ def ask(body: AskIn, request: Request):
             temperature=0.0,
             max_output_tokens=900,
         )
-        t_ai3 = time.time()
-
-        answer2 = getattr(resp2, "output_text", None) or "No answer."
+        answer2_txt = getattr(resp2, "output_text", None) or "No answer."
         d2 = resp2.model_dump()
         file_ids2 = collect_citation_file_ids(d2)
         refs2 = [file_id_to_filename(fid) for fid in file_ids2]
 
         if refs2:
-            wc2 = len(answer2.split())
+            wc2 = len(answer2_txt.split())
             if wc2 < 1 or wc2 > 1000:
-                answer2 = "The response length is outside allowed bounds (1–1000 words). Please refine your question."
-            payload = {"answer": answer2, "references": refs2}
+                answer2_txt = "The response length is outside allowed bounds (1–1000 words). Please refine your question."
+            answer2_txt = force_inline_if_single_ref(answer2_txt, refs2)
+            answer2_html = md_lite_to_html(answer2_txt)
+            payload = {"answer": answer2_html, "references": refs2}
             set_cached_answer(q, payload)
-            print({
-                "phase": "cache_miss_broad_success",
-                "t_total_ms": int((time.time() - t0) * 1000),
-                "t_rate_limit_ms": int((t_rl1 - t_rl0) * 1000),
-                "t_openai_strict_ms": int((t_ai1 - t_ai0) * 1000),
-                "t_openai_broad_ms": int((t_ai3 - t_ai2) * 1000),
-            })
             return AskOut(**payload)
         else:
-            payload = {"answer": "I don’t have evidence for that in the provided documents.", "references": []}
+            payload = {"answer": md_lite_to_html("I don’t have evidence for that in the provided documents."), "references": []}
             set_cached_answer(q, payload)
-            print({
-                "phase": "cache_miss_no_refs_both",
-                "t_total_ms": int((time.time() - t0) * 1000),
-                "t_rate_limit_ms": int((t_rl1 - t_rl0) * 1000),
-                "t_openai_strict_ms": int((t_ai1 - t_ai0) * 1000),
-                "t_openai_broad_ms": int((t_ai3 - t_ai2) * 1000),
-            })
             return AskOut(**payload)
-    except Exception as e:
-        # If BROAD errors, return strict fallback
-        payload = {"answer": "I don’t have evidence for that in the provided documents.", "references": []}
+    except Exception:
+        payload = {"answer": md_lite_to_html("I don’t have evidence for that in the provided documents."), "references": []}
         set_cached_answer(q, payload)
-        print({
-            "phase": "cache_miss_strict_no_refs_broad_error",
-            "error": str(e),
-            "t_total_ms": int((time.time() - t0) * 1000),
-            "t_openai_strict_ms": int((t_ai1 - t_ai0) * 1000),
-        })
         return AskOut(**payload)
