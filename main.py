@@ -3,7 +3,7 @@ import os, time, json, hashlib, re
 from typing import List, Optional, Dict, Any, Deque
 from collections import defaultdict, deque
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -16,32 +16,38 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID")
 WIX_ORIGIN = os.getenv("WIX_ORIGIN", "https://www.vimarshafoundation.org")
 
-# Rate limit config
+# formatting mode: "html" (default here) or "text"
+ANSWER_FORMAT = os.getenv("ANSWER_FORMAT", "html").lower().strip()
+
+# rate limit config
 MAX_REQ_PER_IP_PER_DAY = int(os.getenv("MAX_REQ_PER_IP_PER_DAY", "50"))
 
-# Cache TTL (seconds)
+# cache TTL (seconds)
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "86400"))  # 1 day
 
-# Redis (optional but recommended)
+# Redis (optional)
 REDIS_URL = os.getenv("REDIS_URL")
 try:
-    import redis  # ensure: redis>=5.0.1 in requirements.txt
+    import redis  # ensure redis>=5.0.1 in requirements.txt
     r = redis.from_url(REDIS_URL) if REDIS_URL else None
 except Exception:
     r = None
 
-# In-memory cache fallback: key -> {"exp": float, "payload": dict}
+# Manual flush protection
+FLUSH_TOKEN = os.getenv("FLUSH_TOKEN")  # set a random string in Railway vars
+
+# In-memory cache fallback
 _cache_mem: Dict[str, Dict[str, Any]] = {}
 
 # OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-app = FastAPI(title="Vimarsha Chat API", version="1.4")
+app = FastAPI(title="Vimarsha Chat API", version="1.7")
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later to [WIX_ORIGIN]
+    allow_origins=["*"],  # tighten to [WIX_ORIGIN] when ready
     allow_credentials=True,
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
@@ -53,17 +59,12 @@ class AskIn(BaseModel):
     userId: Optional[str] = None
 
 class AskOut(BaseModel):
-    answer: str
+    answer: str   # HTML if ANSWER_FORMAT=html, plain text otherwise
     references: List[str] = []
 
-# ── helpers: text cleanup, rate limiting, caching ─────────────────────────────
+# ── helpers: text, rate-limiting, caching ─────────────────────────────────────
 WINDOW_SECONDS = 24 * 60 * 60
 _ip_hits: Dict[str, Deque[float]] = defaultdict(deque)
-
-def strip_bold(text: str) -> str:
-    if not text:
-        return text
-    return re.sub(r"\*\*(.*?)\*\*", r"\1", text)
 
 def normalize_question(q: str) -> str:
     """Normalize to increase cache hits across small variations."""
@@ -98,7 +99,7 @@ def check_rate_limit(request: Request):
         raise HTTPException(429, "Rate limit exceeded. Try again tomorrow.")
     q.append(now)
 
-def _qkey(q: str) -> str:
+def _cache_key(q: str) -> str:
     norm = normalize_question(q)
     return "cache:q:" + hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
@@ -116,7 +117,7 @@ def _mem_set(key: str, payload: Dict[str, Any], ttl: int):
     _cache_mem[key] = {"exp": time.time() + ttl, "payload": payload}
 
 def get_cached_answer(q: str):
-    key = _qkey(q)
+    key = _cache_key(q)
     # Redis first
     if r:
         try:
@@ -139,14 +140,12 @@ def get_cached_answer(q: str):
     return None
 
 def set_cached_answer(q: str, payload: Dict[str, Any], ttl: int = CACHE_TTL_SECONDS):
-    key = _qkey(q)
-    # Redis
+    key = _cache_key(q)
     if r:
         try:
             r.setex(key, ttl, json.dumps(payload))
         except Exception:
             pass
-    # Memory
     _mem_set(key, payload, ttl)
 
 # ── OpenAI helpers ────────────────────────────────────────────────────────────
@@ -183,7 +182,7 @@ def file_id_to_filename(fid: str) -> str:
     try:
         meta = client.files.retrieve(fid) if client else None
         fname = getattr(meta, "filename", f"file:{fid}") if meta else f"file:{fid}"
-        base, _ = os.path.splitext(fname)  # strip extension like .pdf
+        base, _ = os.path.splitext(fname)  # strip extension (.pdf)
         return base
     except Exception:
         return f"file:{fid}"
@@ -219,7 +218,30 @@ def debug_env():
         "REDIS_URL_set": bool(REDIS_URL),
         "MAX_REQ_PER_IP_PER_DAY": MAX_REQ_PER_IP_PER_DAY,
         "CACHE_TTL_SECONDS": CACHE_TTL_SECONDS,
+        "ANSWER_FORMAT": ANSWER_FORMAT,
+        "FLUSH_TOKEN_set": bool(FLUSH_TOKEN),
     }
+
+# ======== SYSTEM PROMPTS (text vs html) ========
+SYSTEM_MSG_TEXT = (
+    "Use ONLY the file_search tool with the provided vector store. "
+    "Retrieve about 6–8 of the most relevant passages from diverse documents; prefer coverage over repetition. "
+    "Every claim must be supported by retrieved passages with inline numeric markers like [1], [2]. "
+    "If only one document is used, cite it consistently as [1]. "
+    "If no evidence is found, reply exactly: 'I don’t have evidence for that in the provided documents.' "
+    "Plain text only (no Markdown). Keep between 1 and 1000 words."
+)
+
+SYSTEM_MSG_HTML = (
+    "Use ONLY the file_search tool with the provided vector store. "
+    "Retrieve about 6–8 of the most relevant passages from diverse documents; prefer coverage over repetition. "
+    "Every claim must be supported by retrieved passages with inline numeric markers like [1], [2]. "
+    "If only one document is used, cite it consistently as [1]. "
+    "If no evidence is found, reply exactly: 'I don’t have evidence for that in the provided documents.' "
+    "FORMAT: Output clean HTML only (no scripts/styles). Use <h3> for brief section headings, "
+    "<p> for paragraphs, <strong> for key terms (bold), and <ul><li> for bullet points when helpful. "
+    "Keep between 1 and 1000 words."
+)
 
 @app.post("/ask", response_model=AskOut)
 def ask(body: AskIn, request: Request):
@@ -232,31 +254,17 @@ def ask(body: AskIn, request: Request):
     if not q:
         raise HTTPException(400, "Question is required")
 
-    # ==== CACHE FIRST (fast path) ====
-    t_c0 = time.time()
+    # CACHE FIRST
     cached = get_cached_answer(q)
-    t_c1 = time.time()
     if cached:
-        print({
-            "phase": "cache_hit",
-            "t_total_ms": int((time.time() - t0) * 1000),
-            "t_cache_ms": int((t_c1 - t_c0) * 1000),
-        })
+        print({"phase": "cache_hit", "t_total_ms": int((time.time()-t0)*1000)})
         return AskOut(**cached)
 
     # Only rate-limit if we’ll call OpenAI
-    t_rl0 = time.time()
     check_rate_limit(request)
-    t_rl1 = time.time()
 
-    # System prompt (keep quality; nudge to use minimal relevant context)
-    system_msg = (
-        "Use ONLY the file_search tool with the provided vector store. "
-        "Retrieve at most the top 3 most relevant passages; ignore lower-score matches. "
-        "Every sentence must be supported by retrieved passages with inline [1], [2] markers. "
-        "If no evidence, reply exactly: 'I don’t have evidence for that in the provided documents.' "
-        "Plain text only (no Markdown)."
-    )
+    # Choose prompt based on ANSWER_FORMAT
+    system_msg = SYSTEM_MSG_HTML if ANSWER_FORMAT == "html" else SYSTEM_MSG_TEXT
 
     # OpenAI call
     t_ai0 = time.time()
@@ -268,49 +276,49 @@ def ask(body: AskIn, request: Request):
                 {"role": "user", "content": q},
             ],
             tools=[{"type": "file_search", "vector_store_ids": [OPENAI_VECTOR_STORE_ID]}],
-            temperature=0.0,        # quality-focused, less rambling
-            max_output_tokens=600,  # allow rich answers
+            temperature=0.0,
+            max_output_tokens=1000,   # allow richer answers
         )
     except Exception as e:
         raise HTTPException(502, f"OpenAI call failed: {e}")
     t_ai1 = time.time()
 
-    # Token usage log
-    usage = getattr(resp, "usage", None)
-    try:
-        print({
-            "phase": "usage",
-            "input_tokens": getattr(usage, "input_tokens", None),
-            "output_tokens": getattr(usage, "output_tokens", None),
-            "total_tokens": getattr(usage, "total_tokens", None),
-        })
-    except Exception:
-        pass
-
     # Build answer + refs
-    answer = getattr(resp, "output_text", None) or "No answer."
-    answer = strip_bold(answer)
+    answer = getattr(resp, "output_text", None) or ""
+
+    # enforce word bound (strip HTML tags if present for count)
+    wc = len(re.sub(r"<[^>]+>", " ", answer).split())
+    if wc < 1 or wc > 1000:
+        answer = "The response length is outside allowed bounds (1–1000 words). Please refine your question." \
+                 if ANSWER_FORMAT == "text" \
+                 else "<p>The response length is outside allowed bounds (1–1000 words). Please refine your question.</p>"
 
     d = resp.model_dump()
     file_ids = collect_citation_file_ids(d)
     refs = [file_id_to_filename(fid) for fid in file_ids]
 
+    # Only keep first 8 unique filenames in order of appearance
+    seen, ordered = set(), []
+    for nm in refs:
+        if nm not in seen:
+            seen.add(nm)
+            ordered.append(nm)
+    refs = ordered[:8]
+
     if not refs:
-        payload = {"answer": "I don’t have evidence for that in the provided documents.", "references": []}
+        payload = {
+            "answer": ("I don’t have evidence for that in the provided documents."
+                       if ANSWER_FORMAT == "text"
+                       else "<p>I don’t have evidence for that in the provided documents.</p>"),
+            "references": []
+        }
         set_cached_answer(q, payload)
         print({
             "phase": "cache_miss_no_refs",
             "t_total_ms": int((time.time() - t0) * 1000),
-            "t_cache_ms": int((t_c1 - t_c0) * 1000),
-            "t_rate_limit_ms": int((t_rl1 - t_rl0) * 1000),
             "t_openai_ms": int((t_ai1 - t_ai0) * 1000),
         })
         return AskOut(**payload)
-
-    # Word bound enforcement (kept from your earlier logic)
-    wc = len(answer.split())
-    if wc < 1 or wc > 1000:
-        answer = "The response length is outside allowed bounds (1–1000 words). Please refine your question."
 
     payload = {"answer": answer, "references": refs}
     set_cached_answer(q, payload)
@@ -318,8 +326,39 @@ def ask(body: AskIn, request: Request):
     print({
         "phase": "cache_miss",
         "t_total_ms": int((time.time() - t0) * 1000),
-        "t_cache_ms": int((t_c1 - t_c0) * 1000),
-        "t_rate_limit_ms": int((t_rl1 - t_rl0) * 1000),
         "t_openai_ms": int((t_ai1 - t_ai0) * 1000),
     })
     return AskOut(**payload)
+
+# ── Manual cache wipe (Redis + in-memory) ─────────────────────────────────────
+@app.post("/debug/flush-cache")
+def flush_cache(x_admin_token: Optional[str] = Header(None, convert_underscores=False)):
+    """
+    Wipes cached Q&A. Protect with FLUSH_TOKEN env.
+    Call with: curl -X POST -H "X-Admin-Token: <your-token>" https://.../debug/flush-cache
+    """
+    if not FLUSH_TOKEN:
+        raise HTTPException(403, "Flush disabled: FLUSH_TOKEN not set on server.")
+    if x_admin_token != FLUSH_TOKEN:
+        raise HTTPException(403, "Forbidden: invalid X-Admin-Token.")
+
+    # in-memory
+    _cache_mem.clear()
+
+    # Redis
+    if r:
+        try:
+            # delete only our cache keys (prefix "cache:q:")
+            cursor = 0
+            deleted = 0
+            while True:
+                cursor, keys = r.scan(cursor=cursor, match="cache:q:*", count=1000)
+                if keys:
+                    r.delete(*keys)
+                    deleted += len(keys)
+                if cursor == 0:
+                    break
+            return {"ok": True, "message": f"Cache cleared (redis keys deleted: {deleted})."}
+        except Exception as e:
+            return {"ok": True, "message": f"Cache cleared (memory). Redis error: {str(e)}"}
+    return {"ok": True, "message": "Cache cleared (memory only)."}
