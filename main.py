@@ -9,45 +9,48 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# ── load env ──────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Env & setup
+# ──────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID")
 WIX_ORIGIN = os.getenv("WIX_ORIGIN", "https://www.vimarshafoundation.org")
 
-# Rate limit config
 MAX_REQ_PER_IP_PER_DAY = int(os.getenv("MAX_REQ_PER_IP_PER_DAY", "50"))
-
-# Cache TTL (seconds)
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "86400"))  # 1 day
 
-# Redis (optional but recommended)
+# Redis (optional)
 REDIS_URL = os.getenv("REDIS_URL")
 try:
-    import redis  # ensure: redis>=5.0.1 in requirements.txt
+    import redis  # make sure requirements.txt has: redis>=5.0.1
     r = redis.from_url(REDIS_URL) if REDIS_URL else None
 except Exception:
     r = None
 
-# In-memory cache fallback: key -> {"exp": float, "payload": dict}
+# In-memory cache fallback
 _cache_mem: Dict[str, Dict[str, Any]] = {}
 
 # OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-app = FastAPI(title="Vimarsha Chat API", version="1.4")
+app = FastAPI(title="Vimarsha Chat API", version="1.5")
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# CORS (loose for testing; tighten to [WIX_ORIGIN] when live)
+# ──────────────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later to [WIX_ORIGIN]
+    allow_origins=["*"],   # change to [WIX_ORIGIN] when ready
     allow_credentials=True,
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# ── models ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Models
+# ──────────────────────────────────────────────────────────────────────────────
 class AskIn(BaseModel):
     question: str
     userId: Optional[str] = None
@@ -56,11 +59,14 @@ class AskOut(BaseModel):
     answer: str
     references: List[str] = []
 
-# ── helpers: text cleanup, rate limiting, caching ─────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers: text cleanup, rate limiting, caching
+# ──────────────────────────────────────────────────────────────────────────────
 WINDOW_SECONDS = 24 * 60 * 60
 _ip_hits: Dict[str, Deque[float]] = defaultdict(deque)
 
 def strip_bold(text: str) -> str:
+    """Convert **bold** to plain for Wix text rendering (plain text mode)."""
     if not text:
         return text
     return re.sub(r"\*\*(.*?)\*\*", r"\1", text)
@@ -68,7 +74,7 @@ def strip_bold(text: str) -> str:
 def normalize_question(q: str) -> str:
     """Normalize to increase cache hits across small variations."""
     q = (q or "").lower().strip()
-    q = re.sub(r"[\s\-–—_:;,.!?/\\]+", " ", q)  # collapse punctuation/whitespace
+    q = re.sub(r"[\s\-–—_:;,.!?/\\]+", " ", q)
     return q
 
 def get_client_ip(request: Request) -> str:
@@ -140,16 +146,16 @@ def get_cached_answer(q: str):
 
 def set_cached_answer(q: str, payload: Dict[str, Any], ttl: int = CACHE_TTL_SECONDS):
     key = _qkey(q)
-    # Redis
     if r:
         try:
             r.setex(key, ttl, json.dumps(payload))
         except Exception:
             pass
-    # Memory
     _mem_set(key, payload, ttl)
 
-# ── OpenAI helpers ────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# OpenAI helpers
+# ──────────────────────────────────────────────────────────────────────────────
 def ensure_env_ready():
     missing = []
     if not OPENAI_API_KEY: missing.append("OPENAI_API_KEY")
@@ -188,7 +194,9 @@ def file_id_to_filename(fid: str) -> str:
     except Exception:
         return f"file:{fid}"
 
-# ── routes ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Routes
+# ──────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -221,6 +229,26 @@ def debug_env():
         "CACHE_TTL_SECONDS": CACHE_TTL_SECONDS,
     }
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Two-stage retrieval: STRICT → BROAD (fallback)
+# ──────────────────────────────────────────────────────────────────────────────
+STRICT_MSG = (
+    "Use ONLY the file_search tool with the provided vector store. "
+    "Retrieve at most the top 3 most relevant passages; ignore lower-score matches. "
+    "Every sentence must be supported by retrieved passages with inline [1], [2] markers. "
+    "If no evidence, reply exactly: 'I don’t have evidence for that in the provided documents.' "
+    "Plain text only (no Markdown)."
+)
+
+BROAD_MSG = (
+    "Use ONLY the file_search tool with the provided vector store. "
+    "Retrieve about 6–8 relevant passages from diverse documents; prefer coverage over repetition. "
+    "Aim to support every sentence with inline markers like [1], [2]. "
+    "If any sentence cannot be strictly supported, remove it rather than speculate. "
+    "If no evidence is found, reply exactly: 'I don’t have evidence for that in the provided documents.' "
+    "Plain text only (no Markdown)."
+)
+
 @app.post("/ask", response_model=AskOut)
 def ask(body: AskIn, request: Request):
     t0 = time.time()
@@ -232,9 +260,8 @@ def ask(body: AskIn, request: Request):
     if not q:
         raise HTTPException(400, "Question is required")
 
-    # ==== CACHE FIRST (fast path) ====
-    t_c0 = time.time()
-    cached = get_cached_answer(q)
+    # ==== CACHE FIRST ====
+    t_c0, cached = time.time(), get_cached_answer(q)
     t_c1 = time.time()
     if cached:
         print({
@@ -244,82 +271,104 @@ def ask(body: AskIn, request: Request):
         })
         return AskOut(**cached)
 
-    # Only rate-limit if we’ll call OpenAI
+    # Rate limit only if we’re going to call OpenAI
     t_rl0 = time.time()
     check_rate_limit(request)
     t_rl1 = time.time()
 
-    # System prompt (keep quality; nudge to use minimal relevant context)
-    system_msg = (
-        "Use ONLY the file_search tool with the provided vector store. "
-        "Retrieve at most the top 3 most relevant passages; ignore lower-score matches. "
-        "Every sentence must be supported by retrieved passages with inline [1], [2] markers. "
-        "If no evidence, reply exactly: 'I don’t have evidence for that in the provided documents.' "
-        "Plain text only (no Markdown)."
-    )
-
-    # OpenAI call
+    # --- 1) STRICT attempt (top-3) ---
     t_ai0 = time.time()
     try:
         resp = client.responses.create(
             model=OPENAI_MODEL,
             input=[
-                {"role": "system", "content": system_msg},
+                {"role": "system", "content": STRICT_MSG},
                 {"role": "user", "content": q},
             ],
             tools=[{"type": "file_search", "vector_store_ids": [OPENAI_VECTOR_STORE_ID]}],
-            temperature=0.0,        # quality-focused, less rambling
-            max_output_tokens=600,  # allow rich answers
+            temperature=0.0,
+            max_output_tokens=800,
         )
     except Exception as e:
         raise HTTPException(502, f"OpenAI call failed: {e}")
     t_ai1 = time.time()
 
-    # Token usage log
-    usage = getattr(resp, "usage", None)
-    try:
-        print({
-            "phase": "usage",
-            "input_tokens": getattr(usage, "input_tokens", None),
-            "output_tokens": getattr(usage, "output_tokens", None),
-            "total_tokens": getattr(usage, "total_tokens", None),
-        })
-    except Exception:
-        pass
-
-    # Build answer + refs
     answer = getattr(resp, "output_text", None) or "No answer."
     answer = strip_bold(answer)
-
     d = resp.model_dump()
     file_ids = collect_citation_file_ids(d)
     refs = [file_id_to_filename(fid) for fid in file_ids]
 
-    if not refs:
-        payload = {"answer": "I don’t have evidence for that in the provided documents.", "references": []}
+    # If STRICT found citations → return
+    if refs:
+        wc = len(answer.split())
+        if wc < 1 or wc > 1000:
+            answer = "The response length is outside allowed bounds (1–1000 words). Please refine your question."
+        payload = {"answer": answer, "references": refs}
         set_cached_answer(q, payload)
         print({
-            "phase": "cache_miss_no_refs",
+            "phase": "cache_miss_strict_success",
             "t_total_ms": int((time.time() - t0) * 1000),
             "t_cache_ms": int((t_c1 - t_c0) * 1000),
             "t_rate_limit_ms": int((t_rl1 - t_rl0) * 1000),
-            "t_openai_ms": int((t_ai1 - t_ai0) * 1000),
+            "t_openai_strict_ms": int((t_ai1 - t_ai0) * 1000),
         })
         return AskOut(**payload)
 
-    # Word bound enforcement (kept from your earlier logic)
-    wc = len(answer.split())
-    if wc < 1 or wc > 1000:
-        answer = "The response length is outside allowed bounds (1–1000 words). Please refine your question."
+    # --- 2) BROAD attempt (6–8 diverse) if STRICT produced no refs ---
+    try:
+        t_ai2 = time.time()
+        resp2 = client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": BROAD_MSG},
+                {"role": "user", "content": q},
+            ],
+            tools=[{"type": "file_search", "vector_store_ids": [OPENAI_VECTOR_STORE_ID]}],
+            temperature=0.0,
+            max_output_tokens=900,
+        )
+        t_ai3 = time.time()
 
-    payload = {"answer": answer, "references": refs}
-    set_cached_answer(q, payload)
+        answer2 = getattr(resp2, "output_text", None) or "No answer."
+        answer2 = strip_bold(answer2)
+        d2 = resp2.model_dump()
+        file_ids2 = collect_citation_file_ids(d2)
+        refs2 = [file_id_to_filename(fid) for fid in file_ids2]
 
-    print({
-        "phase": "cache_miss",
-        "t_total_ms": int((time.time() - t0) * 1000),
-        "t_cache_ms": int((t_c1 - t_c0) * 1000),
-        "t_rate_limit_ms": int((t_rl1 - t_rl0) * 1000),
-        "t_openai_ms": int((t_ai1 - t_ai0) * 1000),
-    })
-    return AskOut(**payload)
+        if refs2:
+            wc2 = len(answer2.split())
+            if wc2 < 1 or wc2 > 1000:
+                answer2 = "The response length is outside allowed bounds (1–1000 words). Please refine your question."
+            payload = {"answer": answer2, "references": refs2}
+            set_cached_answer(q, payload)
+            print({
+                "phase": "cache_miss_broad_success",
+                "t_total_ms": int((time.time() - t0) * 1000),
+                "t_rate_limit_ms": int((t_rl1 - t_rl0) * 1000),
+                "t_openai_strict_ms": int((t_ai1 - t_ai0) * 1000),
+                "t_openai_broad_ms": int((t_ai3 - t_ai2) * 1000),
+            })
+            return AskOut(**payload)
+        else:
+            payload = {"answer": "I don’t have evidence for that in the provided documents.", "references": []}
+            set_cached_answer(q, payload)
+            print({
+                "phase": "cache_miss_no_refs_both",
+                "t_total_ms": int((time.time() - t0) * 1000),
+                "t_rate_limit_ms": int((t_rl1 - t_rl0) * 1000),
+                "t_openai_strict_ms": int((t_ai1 - t_ai0) * 1000),
+                "t_openai_broad_ms": int((t_ai3 - t_ai2) * 1000),
+            })
+            return AskOut(**payload)
+    except Exception as e:
+        # If BROAD errors, return strict fallback
+        payload = {"answer": "I don’t have evidence for that in the provided documents.", "references": []}
+        set_cached_answer(q, payload)
+        print({
+            "phase": "cache_miss_strict_no_refs_broad_error",
+            "error": str(e),
+            "t_total_ms": int((time.time() - t0) * 1000),
+            "t_openai_strict_ms": int((t_ai1 - t_ai0) * 1000),
+        })
+        return AskOut(**payload)
