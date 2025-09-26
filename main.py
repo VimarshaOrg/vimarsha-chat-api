@@ -204,7 +204,7 @@ def ask(body: AskIn, request: Request):
     system_msg = (
         "Use ONLY the file_search tool with the provided vector store. "
         "Retrieve at most the top 11 most relevant passages; ignore lower-score matches. "
-        "Every sentence must be supported by retrieved passages with inline [1], [2] markers. "
+        "Each paragraph (or major point) must be supported by retrieved passages with inline [1], [2] markers."
         "If no evidence, reply exactly: 'I don’t have evidence for that in the provided documents.' "
         "Plain text only (no Markdown)."
     )
